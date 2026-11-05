@@ -15,7 +15,7 @@ Cloudflare 优选 IP 自动化更新与健康巡检
   6. 失败 IP 进 24h 黑名单；只有「本轮有候选通过」时才登记，避免站点故障污染黑名单。
   7. 稳定优先：仍然健康的现有 IP 一律保留；只有失效的才立即替换，缺额才补。
      想换掉健康的 IP 必须「满 rotate_after 时长」且「候选快 rotate_gain_ms 以上」。
-  8. 单实例锁 + 状态/黑名单落盘 + Telegram 告警（复用 /root/.secrets/tg.env）。
+  8. 单实例锁 + 状态/黑名单落盘 + Telegram 告警（token 放独立 env 文件，路径可配）。
 
 用法：
   cf2dns.py --dry-run            # 只探测与决策，不写 DNS、不告警、不落盘
@@ -175,7 +175,7 @@ def http_json(url, payload=None, headers=None, timeout=8):
 
 
 def send_telegram(text, config):
-    """告警走 VPS 既有的 netcupfucker_bot（/root/.secrets/tg.env）。"""
+    """推 Telegram 告警：从配置的 env 文件读 TG_TOKEN / TG_CHAT。"""
     env = {}
     env_file = config.get("telegram_env_file") or DEFAULT_TG_ENV
     if not os.path.exists(env_file):
