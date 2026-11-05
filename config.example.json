@@ -1,0 +1,35 @@
+{
+  "secret_id": "腾讯云 SecretId（建议用只授权 DNSPod 的子账号）",
+  "secret_key": "腾讯云 SecretKey",
+  "domain": "example.com",
+  "subdomain": "@",
+  "default_ip": "104.21.81.143",
+  "fallback_ips": {
+    "电信": "162.159.192.1",
+    "联通": "104.17.1.1",
+    "移动": "104.19.1.1",
+    "境外": "162.159.192.1"
+  },
+  "lines": {
+    "默认": { "pool": null, "records": 1 },
+    "电信": { "pool": "CT", "records": 2 },
+    "联通": { "pool": "CU", "records": 2 },
+    "移动": { "pool": "CM", "records": 2 },
+    "境外": { "pool": "CT", "records": 2 }
+  },
+  "ttl": 600,
+  "probe": {
+    "path": "/robots.txt",
+    "timeout": 3,
+    "attempts": 2
+  },
+  "switch": {
+    "rotate_after": 21600,
+    "rotate_gain_ms": 25
+  },
+  "blacklist_ttl": 21600,
+  "blacklist_fail_threshold": 2,
+  "alert_cooldown": 21600,
+  "telegram_env_file": "/etc/cf2dns/telegram.env",
+  "www_cname": "example.com."
+}
