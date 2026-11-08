@@ -1,0 +1,34 @@
+name: CF2DNS Failover Watchdog
+
+on:
+  schedule:
+    # 每 30 分钟检查一次（避开 00/30 分的高峰，放在 15 和 45 分）
+    - cron: '15,45 * * * *'
+  workflow_dispatch: # 允许在 GitHub 控制台手动点击测试
+
+jobs:
+  failover-check:
+    name: Check Heartbeat & Standby Sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Failover Watchdog
+        env:
+          TC_SECRET_ID: ${{ secrets.TC_SECRET_ID }}
+          TC_SECRET_KEY: ${{ secrets.TC_SECRET_KEY }}
+          DOMAIN: ${{ secrets.DOMAIN || 'skcso.com' }}
+          CF2DNS_HEARTBEAT_URL: ${{ secrets.CF2DNS_HEARTBEAT_URL || 'https://skcso.com/api/cf2dns' }}
+          CF2DNS_HEARTBEAT_TOKEN: ${{ secrets.CF2DNS_HEARTBEAT_TOKEN }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: |
+          python3 cf2dns.py --failover --node-id gha

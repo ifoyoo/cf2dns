@@ -118,11 +118,30 @@ log = logging.getLogger("cf2dns")
 # 基础工具
 # --------------------------------------------------------------------------
 def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        log.error("配置文件不存在: %s", CONFIG_FILE)
-        sys.exit(1)
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        config = json.load(f)
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    else:
+        example = os.path.join(SCRIPT_DIR, "config.example.json")
+        if os.path.exists(example):
+            with open(example, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        else:
+            log.error("配置文件不存在: %s", CONFIG_FILE)
+            sys.exit(1)
+
+    # 允许系统环境变量覆盖配置（特别方便 GitHub Actions 与容器化环境）
+    if os.environ.get("TC_SECRET_ID"):
+        config["secret_id"] = os.environ["TC_SECRET_ID"]
+    if os.environ.get("TC_SECRET_KEY"):
+        config["secret_key"] = os.environ["TC_SECRET_KEY"]
+    if os.environ.get("DOMAIN"):
+        config["domain"] = os.environ["DOMAIN"]
+    if os.environ.get("CF2DNS_HEARTBEAT_URL"):
+        config["heartbeat_url"] = os.environ["CF2DNS_HEARTBEAT_URL"]
+    if os.environ.get("CF2DNS_HEARTBEAT_TOKEN"):
+        config["heartbeat_token"] = os.environ["CF2DNS_HEARTBEAT_TOKEN"]
 
     config.setdefault("lines", DEFAULT_LINES)
     config.setdefault("fallback_ips", DEFAULT_FALLBACKS)
@@ -141,7 +160,7 @@ def load_config():
     config.setdefault("subdomain", "@")
     config.setdefault("telegram_env_file", DEFAULT_TG_ENV)
     config.setdefault("hostmonit_key", "o1zrmHAF")  # 上游公开 key，可换成自己的
-    # www_cname / default_ip 属于站点相关配置，故意不给默认值：不配就不动这几条记录
+    config.setdefault("heartbeat_url", "https://skcso.com/api/cf2dns")
     return config
 
 
@@ -175,26 +194,25 @@ def http_json(url, payload=None, headers=None, timeout=8):
 
 
 def send_telegram(text, config):
-    """推 Telegram 告警：从配置的 env 文件读 TG_TOKEN / TG_CHAT。"""
+    """推 Telegram 告警：优先读环境变量，其次从配置的 env 文件读 TG_TOKEN / TG_CHAT。"""
     env = {}
     env_file = config.get("telegram_env_file") or DEFAULT_TG_ENV
-    if not os.path.exists(env_file):
-        log.info("未配置 Telegram env 文件（%s），跳过告警", env_file)
-        return False
-    try:
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"').strip("'")
-    except Exception as e:
-        log.warning("读不到 Telegram 配置 %s: %s", env_file, e)
-        return False
-    token, chat = env.get("TG_TOKEN"), env.get("TG_CHAT")
+    if os.path.exists(env_file):
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+        except Exception as e:
+            log.warning("读不到 Telegram 配置 %s: %s", env_file, e)
+
+    token = os.environ.get("TG_TOKEN") or env.get("TG_TOKEN")
+    chat = os.environ.get("TG_CHAT") or env.get("TG_CHAT")
     if not token or not chat:
-        log.warning("Telegram 配置缺少 TG_TOKEN / TG_CHAT")
+        log.info("未配置 Telegram Token/Chat，跳过告警")
         return False
     try:
         body = urllib.parse.urlencode(
@@ -208,6 +226,88 @@ def send_telegram(text, config):
     except Exception as e:
         log.warning("Telegram 告警发送失败: %s", e)
         return False
+
+
+def report_heartbeat(config, decisions, node_id="vps", status="ok", message=""):
+    """向博客中心上报节点心跳与当前三网优选结果"""
+    url = config.get("heartbeat_url")
+    token = config.get("heartbeat_token")
+    if not url or not token:
+        log.info("未配置 heartbeat_url 或 heartbeat_token，跳过心跳上报")
+        return False
+
+    payload = {
+        "node_id": node_id,
+        "status": status,
+        "lines": decisions,
+        "message": message or f"由 {node_id} 调度完成",
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": f"cf2dns/{node_id}",
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            if res.get("ok"):
+                log.info("[%s] 心跳成功同步至 %s", node_id, url)
+                return True
+            else:
+                log.warning("[%s] 心跳同步返回失败: %s", node_id, res)
+    except Exception as e:
+        log.warning("[%s] 心跳上报异常: %s", node_id, e)
+    return False
+
+
+def check_failover(config, node_id="gha"):
+    """
+    检查主力节点的心跳是否超时。
+    若主力正常，返回 False（备机无需接管，直接退出）；
+    若主力失联（>90m 或无法连接），返回 True（备机激活接管）。
+    """
+    url = config.get("heartbeat_url")
+    if not url:
+        log.info("未配置 heartbeat_url，备机默认接管执行")
+        return True
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"cf2dns/{node_id}"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if not data.get("ok"):
+                log.warning("心跳接口返回异常状态，备机接管: %s", data)
+                return True
+
+            is_stale = data.get("is_stale", True)
+            elapsed = data.get("elapsed_seconds")
+            primary_node = data.get("node_id") or "vps"
+
+            if not is_stale:
+                log.info(
+                    "[standby] 主力探针（%s）运行正常（上次打卡于 %s 秒前）。备机（%s）退避待命。",
+                    primary_node,
+                    elapsed,
+                    node_id,
+                )
+                return False
+
+            log.warning(
+                "[failover] ⚠️ 警告：主力探针（%s）心跳超时（已过去 %s 秒）！备机（%s）激活接管！",
+                primary_node,
+                elapsed,
+                node_id,
+            )
+            return True
+    except Exception as e:
+        log.warning("无法获取心跳状态（%s），为保证高可用，备机（%s）激活接管", e, node_id)
+        return True
 
 
 def maybe_alert(config, state, dry_run, key, text):
@@ -667,7 +767,7 @@ def cleanup_line_cnames(config, records, lines):
 # --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
-def run_sync(config, dry_run=False):
+def run_sync(config, dry_run=False, node_id="vps"):
     domain = config["domain"]
     host = config.get("probe_host") or domain
     ttl = config["ttl"]
@@ -851,15 +951,38 @@ def run_sync(config, dry_run=False):
 
     if not dry_run:
         save_json(STATE_FILE, state)
+        clean_decisions = {k: list(v) if v else [] for k, v in decisions.items()}
+        report_heartbeat(config, clean_decisions, node_id=node_id)
+        if node_id != "vps":
+            send_telegram(
+                f"🚨 [cf2dns 备机接管]\n"
+                f"主机探针心跳超时，备机（{node_id}）已接管 {config['domain']} 的 DNS 优选调度！\n"
+                f"已完成健康探测并刷新三网解析记录。",
+                config,
+            )
 
     log.info("=== 巡检完成 ===")
     return 0
+
+
+def ensure_state_dir():
+    global STATE_DIR, STATE_FILE, BLACKLIST_FILE, CF_RANGES_CACHE
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+    except (PermissionError, OSError):
+        STATE_DIR = os.path.join(SCRIPT_DIR, ".state")
+        os.makedirs(STATE_DIR, exist_ok=True)
+        STATE_FILE = os.path.join(STATE_DIR, "state.json")
+        BLACKLIST_FILE = os.path.join(STATE_DIR, "blacklist.json")
+        CF_RANGES_CACHE = os.path.join(STATE_DIR, "cf-ips-v4.txt")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Cloudflare 优选 IP 同步")
     parser.add_argument("--dry-run", action="store_true", help="只探测，不写 DNS")
     parser.add_argument("--config", help="配置文件路径（默认 <脚本目录>/config.json）")
+    parser.add_argument("--failover", action="store_true", help="以备机故障转移模式运行：先查心跳，超时才接管")
+    parser.add_argument("--node-id", default="vps", help="当前节点标识（默认 vps，GitHub Actions 可传 gha）")
     args = parser.parse_args()
 
     if args.config:
@@ -867,11 +990,16 @@ def main():
         CONFIG_FILE = os.path.abspath(args.config)
     config = load_config()
 
-    os.makedirs(STATE_DIR, exist_ok=True)
+    if args.failover:
+        should_run = check_failover(config, node_id=args.node_id)
+        if not should_run:
+            return 0
+
+    ensure_state_dir()
     try:
         lock = open(LOCK_FILE, "w")
-    except PermissionError:
-        lock = open("/tmp/cf2dns.lock", "w")
+    except (PermissionError, OSError):
+        lock = open(os.path.join(STATE_DIR, "cf2dns.lock"), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -879,7 +1007,7 @@ def main():
         return 0
 
     try:
-        return run_sync(config, dry_run=args.dry_run)
+        return run_sync(config, dry_run=args.dry_run, node_id=args.node_id)
     except Exception:
         log.exception("巡检异常")
         state = load_json(STATE_FILE, {})

@@ -68,6 +68,8 @@ python3 cf2dns.py              # 正式跑一轮
 | `blacklist_ttl` / `blacklist_fail_threshold` | `21600` / `2` | 黑名单冷却时长、连续失败几轮才拉黑 |
 | `alert_cooldown` | `21600` | 同类告警的冷却时间 |
 | `telegram_env_file` | `/etc/cf2dns/telegram.env` | 内含 `TG_TOKEN` / `TG_CHAT`，不配则不发告警 |
+| `heartbeat_url` | `https://skcso.com/api/cf2dns` | 博客/中心心跳打卡与监控接口，用于主备协同 |
+| `heartbeat_token` | 无 | 心跳上报鉴权 Token（与服务端环境变量一致） |
 | `www_cname` | 无 | 配了就维护 `www` 的 CNAME，如 `example.com.` |
 | `hostmonit_key` | 公开 key | Hostmonit 优选池的 key，可换自己的 |
 
