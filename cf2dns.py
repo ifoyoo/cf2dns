@@ -63,19 +63,25 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-# 线路 -> 优选池。境外线路用电信池（上游 cf2dns 的做法）。
+# 线路 -> 优选池。境外/教育网用电信池，广电用移动池，搜索引擎用官方固定 Anycast。
 DEFAULT_LINES = {
     "默认": {"pool": None, "records": 1},
     "电信": {"pool": "CT", "records": 2},
     "联通": {"pool": "CU", "records": 2},
     "移动": {"pool": "CM", "records": 2},
     "境外": {"pool": "CT", "records": 2},
+    "教育网": {"pool": "CT", "records": 2},
+    "广电": {"pool": "CM", "records": 2},
+    "搜索引擎": {"pool": None, "records": 1},
 }
 DEFAULT_FALLBACKS = {
     "电信": "162.159.192.1",
     "联通": "104.17.1.1",
     "移动": "104.19.1.1",
     "境外": "162.159.192.1",
+    "教育网": "162.159.192.1",
+    "广电": "104.19.1.1",
+    "搜索引擎": "104.21.81.143",
 }
 
 # 最后一道保险：拉不到官方段列表时用它（2026-11 从 api.cloudflare.com/client/v4/ips 抄下）
@@ -693,6 +699,7 @@ def apply_line(config, records, line, targets, ttl):
                 "RecordLine": line,
                 "Value": ip,
                 "TTL": ttl,
+                "Remark": "cf2dns:auto",
             },
             config,
         )
@@ -718,6 +725,7 @@ def apply_line(config, records, line, targets, ttl):
                 "RecordLine": line,
                 "Value": replacement,
                 "TTL": ttl,
+                "Remark": "cf2dns:auto",
             },
             config,
         )
@@ -930,6 +938,7 @@ def run_sync(config, dry_run=False, node_id="vps"):
                     "RecordLine": "默认",
                     "Value": want,
                     "TTL": ttl,
+                    "Remark": "cf2dns:auto",
                 },
                 config,
             )
@@ -944,6 +953,7 @@ def run_sync(config, dry_run=False, node_id="vps"):
                     "RecordLine": "默认",
                     "Value": want,
                     "TTL": ttl,
+                    "Remark": "cf2dns:auto",
                 },
                 config,
             )
