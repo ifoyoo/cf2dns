@@ -39,5 +39,6 @@
   "telegram_env_file": "/etc/cf2dns/telegram.env",
   "heartbeat_url": "https://skcso.com/api/cf2dns",
   "heartbeat_token": "与服务端一致的心跳通信密钥（如 CF2DNS_TOKEN）",
+  "lease_seconds": 5400,
   "www_cname": "example.com."
 }

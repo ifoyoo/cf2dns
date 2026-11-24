@@ -6,18 +6,25 @@ on:
     - cron: '15,45 * * * *'
   workflow_dispatch: # 允许在 GitHub 控制台手动点击测试
 
+concurrency:
+  group: cf2dns-failover
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   failover-check:
     name: Check Heartbeat & Standby Sync
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           python-version: '3.11'
 

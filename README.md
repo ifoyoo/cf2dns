@@ -25,6 +25,8 @@ Hostmonit 优选池 ──> 真实 TLS 探测 + Cloudflare 网段校验 ──> 
 | 先建后删 | 新增 → 原地修改 → 最后才删多余，避免出现「根域名没有任何 A 记录」的中间态 |
 | 黑名单 | 连续 2 轮探测失败的 IP 进 6 小时黑名单；重新可用后自动释放 |
 | 告警 | 降级到兜底、线路无节点、源站疑似故障、脚本异常，推 Telegram（可选） |
+| 主备租约 | 写 DNS 前先调 `/api/cf2dns` 的 `acquire`；VPS/GHA 只有拿到租约才写，避免双写 |
+| 记录所有权 | 只改/删 `Remark=cf2dns:auto` 的记录；同线路出现手工记录时整条跳过并告警 |
 | 单实例锁 | 上一轮没跑完时本轮直接跳过 |
 
 **为什么探 `/robots.txt` 而不是 `/`**：首页是渲染产物，站点自己的一次部署事故（比如只传上去一半静态资产）会让首页 404，而 `/robots.txt` 这类静态资产照常 200。探首页会把「本站出问题」误判成「所有节点都坏了」，进而把 DNS 全线降级。探静态资产能把这两件事解耦。
@@ -35,6 +37,8 @@ Hostmonit 优选池 ──> 真实 TLS 探测 + Cloudflare 网段校验 ──> 
 git clone <this repo> && cd cf2dns
 cp config.example.json config.json
 chmod 600 config.json          # 里面是腾讯云密钥，别让其他用户读
+# 如果 config.json 缺失，脚本会拒绝回退 example；GHA 通过 TC_SECRET_ID 环境变量
+# 显式允许 example + 覆盖，本地要强制使用 example 可设 CF2DNS_ALLOW_EXAMPLE=1。
 $EDITOR config.json
 python3 cf2dns.py --dry-run    # 只探测 + 打印决策，不写 DNS
 python3 cf2dns.py              # 正式跑一轮
@@ -65,11 +69,12 @@ python3 cf2dns.py              # 正式跑一轮
 | `probe.timeout` / `probe.attempts` | `3` / `2` | 单次握手超时、每轮尝试次数 |
 | `switch.rotate_after` | `21600` | 允许轮换健康 IP 的最小间隔（秒） |
 | `switch.rotate_gain_ms` | `25` | 轮换需要拿到的最小延迟收益 |
-| `blacklist_ttl` / `blacklist_fail_threshold` | `21600` / `2` | 黑名单冷却时长、连续失败几轮才拉黑 |
+| `blacklist_ttl` / `blacklist_fail_threshold` | `21600` / `2` | 黑名单冷却时长（6h）、连续失败几轮才拉黑 |
 | `alert_cooldown` | `21600` | 同类告警的冷却时间 |
 | `telegram_env_file` | `/etc/cf2dns/telegram.env` | 内含 `TG_TOKEN` / `TG_CHAT`，不配则不发告警 |
-| `heartbeat_url` | `https://skcso.com/api/cf2dns` | 博客/中心心跳打卡与监控接口，用于主备协同 |
-| `heartbeat_token` | 无 | 心跳上报鉴权 Token（与服务端环境变量一致） |
+| `heartbeat_url` | `https://skcso.com/api/cf2dns` | 心跳/租约接口，用于主备协同 |
+| `heartbeat_token` | 无 | 心跳/租约鉴权 Token（与服务端环境变量一致） |
+| `lease_seconds` | `5400` | 租约时长（秒）。VPS 每 30 分钟续租；失联超过租约后 GHA 才能接管 |
 | `www_cname` | 无 | 配了就维护 `www` 的 CNAME，如 `example.com.` |
 | `hostmonit_key` | 公开 key | Hostmonit 优选池的 key，可换自己的 |
 
@@ -112,3 +117,41 @@ curl -o /dev/null -w '%{http_code}\n' --resolve example.com:443:<ip> https://exa
 ## License
 
 MIT
+
+
+## 主备租约（VPS + GitHub Actions）
+
+`cf2dns.py` 每次写 DNSPod 前都会先向 `/api/cf2dns` 申请租约：
+
+```text
+VPS ── acquire(lease 90m) ──> 写 DNSPod ──> heartbeat
+GHA ── GET ?fresh=1 ──> 仅当 VPS 心跳超时且租约过期 ──> acquire(gha) ──> 写 DNSPod
+```
+
+- 租约由 D1 原子更新，同一时刻只有一个 `owner` 能写 DNS；
+- VPS 心跳失败/租约申请失败时**不写 DNS**，只报活；
+- GHA 看到 VPS 恢复报活会主动释放租约，VPS 下一轮再接管；
+- GHA 接管时禁止按境外延迟轮换，VPS 刚收回租约时也有 6h 冷却，避免解析抖动；
+- 心跳接口不可达时，GHA fail-safe，不会盲目接管（宁可暂时不切换，也不双写）。
+
+GitHub Actions 使用 `.github/workflows/failover-sync.yml`，必须显式传
+`--failover --node-id gha`；只传 `--failover` 时脚本会自动按 `gha` 运行，
+但显式写出来更清楚。
+
+## 记录所有权
+
+所有自动创建的 A/CNAME 都带 `Remark: "cf2dns:auto"`。脚本只会改/删这些记录；
+同一条线路上如果出现未标记的手工 A/CNAME，会整条跳过并告警，不会覆盖。
+`www` 同理：存在手工记录时不碰。
+
+## 探测视角
+
+VPS 在德国、GHA 在美国，脚本只能验证「这个 IP 现在能不能出你的页面」，
+不能证明「它对某个运营商最快」。候选池的运营商排序来自 Hostmonit；脚本按池内
+顺序补位，不再用德国/美国的握手耗时重排。真正要按运营商测速，需要国内多线探针。
+
+## 测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```

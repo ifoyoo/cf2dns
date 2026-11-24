@@ -12,10 +12,11 @@ Cloudflare 优选 IP 自动化更新与健康巡检
   3. 所有候选（含兜底）都验不过时判定为「源站问题」，本轮不动 DNS 并告警。
   4. 写入前校验 IP 落在 Cloudflare 公布段内，防数据源污染写出不可解析的记录。
   5. 先建后删：新记录建立成功后才清理旧记录/旧 CNAME，避免中途失败留下空记录。
-  6. 失败 IP 进 24h 黑名单；只有「本轮有候选通过」时才登记，避免站点故障污染黑名单。
+  6. 失败 IP 进 6h 黑名单；只有「本轮有候选通过」时才登记，避免站点故障污染黑名单。
   7. 稳定优先：仍然健康的现有 IP 一律保留；只有失效的才立即替换，缺额才补。
      想换掉健康的 IP 必须「满 rotate_after 时长」且「候选快 rotate_gain_ms 以上」。
-  8. 单实例锁 + 状态/黑名单落盘 + Telegram 告警（token 放独立 env 文件，路径可配）。
+  8. D1 租约：VPS/GHA 写 DNS 前先 acquire；心跳失败不写，避免主备同时改解析。
+  9. 单实例锁 + 状态/黑名单落盘 + Telegram 告警（token 放独立 env 文件，路径可配）。
 
 用法：
   cf2dns.py --dry-run            # 只探测与决策，不写 DNS、不告警、不落盘
@@ -41,7 +42,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("CF2DNS_CONFIG") or os.path.join(SCRIPT_DIR, "config.json")
@@ -62,6 +63,9 @@ BROWSER_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+# SSLContext 可跨线程复用；每个 IP 新建一次会白白重复加载证书链。
+TLS_CONTEXT = ssl.create_default_context()
 
 # 线路 -> 优选池。境外/教育网用电信池，广电用移动池，搜索引擎用官方固定 Anycast。
 DEFAULT_LINES = {
@@ -129,6 +133,11 @@ def load_config():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             config = json.load(f)
     else:
+        # GHA 用 example + 环境变量覆盖是显式支持的；普通 VPS 缺 config 时不能
+        # 悄悄拿 example 的占位域名/密钥跑。需要 example 必须显式给环境变量。
+        if not os.environ.get("TC_SECRET_ID") and os.environ.get("CF2DNS_ALLOW_EXAMPLE") != "1":
+            log.error("配置文件不存在: %s（拒绝回退 example；如确需请设 CF2DNS_ALLOW_EXAMPLE=1）", CONFIG_FILE)
+            sys.exit(1)
         example = os.path.join(SCRIPT_DIR, "config.example.json")
         if os.path.exists(example):
             with open(example, "r", encoding="utf-8") as f:
@@ -163,6 +172,7 @@ def load_config():
     config.setdefault("blacklist_fail_threshold", 2)
     config.setdefault("cf_ranges_ttl", 86400)
     config.setdefault("alert_cooldown", 21600)
+    config.setdefault("lease_seconds", LEASE_SECONDS)
     config.setdefault("subdomain", "@")
     config.setdefault("telegram_env_file", DEFAULT_TG_ENV)
     config.setdefault("hostmonit_key", "o1zrmHAF")  # 上游公开 key，可换成自己的
@@ -230,28 +240,25 @@ def send_telegram(text, config):
         urllib.request.urlopen(req, timeout=15).read()
         return True
     except Exception as e:
-        log.warning("Telegram 告警发送失败: %s", e)
+        # Telegram 的错误信息里可能带 bot token；只记录类型，别把 token 写进日志。
+        log.warning("Telegram 告警发送失败: %s", type(e).__name__)
         return False
 
 
-def report_heartbeat(config, decisions, node_id="vps", status="ok", message=""):
-    """向博客中心上报节点心跳与当前三网优选结果"""
+LEASE_SECONDS = 90 * 60
+
+
+def post_heartbeat(config, payload):
+    """POST 到 D1 心跳端点。返回解析后的 JSON；失败返回 None（调用方决定是否继续）。"""
     url = config.get("heartbeat_url")
     token = config.get("heartbeat_token")
     if not url or not token:
-        log.info("未配置 heartbeat_url 或 heartbeat_token，跳过心跳上报")
-        return False
-
-    payload = {
-        "node_id": node_id,
-        "status": status,
-        "lines": decisions,
-        "message": message or f"由 {node_id} 调度完成",
-    }
+        log.info("未配置 heartbeat_url 或 heartbeat_token，跳过心跳")
+        return None
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "User-Agent": f"cf2dns/{node_id}",
+        "User-Agent": f"cf2dns/{payload.get('node_id', 'vps')}",
     }
     try:
         req = urllib.request.Request(
@@ -261,60 +268,151 @@ def report_heartbeat(config, decisions, node_id="vps", status="ok", message=""):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            if res.get("ok"):
-                log.info("[%s] 心跳成功同步至 %s", node_id, url)
-                return True
-            else:
-                log.warning("[%s] 心跳同步返回失败: %s", node_id, res)
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("ok"):
+                return data
+            log.warning("心跳返回失败: %s", data)
     except Exception as e:
-        log.warning("[%s] 心跳上报异常: %s", node_id, e)
-    return False
+        log.warning("心跳上报异常: %s", e)
+    return None
+
+
+def report_heartbeat(
+    config,
+    decisions=None,
+    node_id="vps",
+    status="ok",
+    message="",
+    *,
+    op="heartbeat",
+    lease_seconds=None,
+    state=None,
+    include_lines=True,
+):
+    """上报心跳。op=heartbeat 只报活；op=acquire 才拿/续租约。"""
+    payload = {
+        "op": op,
+        "node_id": node_id,
+        "status": status,
+        "message": message or f"由 {node_id} 调度完成",
+    }
+    if decisions is not None and include_lines:
+        payload["lines"] = {
+            str(k): list(v) if v else [] for k, v in decisions.items()
+        }
+    if lease_seconds is not None:
+        payload["lease_seconds"] = int(lease_seconds)
+    if state is not None:
+        payload["state"] = state
+    data = post_heartbeat(config, payload)
+    if data:
+        log.info("[%s] 心跳同步成功（%s）", node_id, status)
+    return data
+
+
+def fetch_heartbeat(config):
+    """读取心跳。GHA 用 ?fresh=1 绕开可能存在的浏览器/CDN 短缓存。"""
+    url = config.get("heartbeat_url")
+    if not url:
+        return None
+    sep = "&" if "?" in url else "?"
+    try:
+        req = urllib.request.Request(
+            f"{url}{sep}fresh=1",
+            headers={"User-Agent": "cf2dns/failover"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning("读取心跳失败: %s", e)
+        return None
+
+
+def acquire_lease(config, node_id, *, status="starting", message="", lease_seconds=None):
+    """拿/续主备租约；返回 API 的完整响应，失败返回 None。"""
+    seconds = lease_seconds or int(config.get("lease_seconds", LEASE_SECONDS))
+    data = report_heartbeat(
+        config,
+        None,
+        node_id=node_id,
+        status=status,
+        message=message,
+        op="acquire",
+        lease_seconds=seconds,
+        include_lines=False,
+    )
+    return data
+
+
+def release_lease(config, node_id, *, status="released", message=""):
+    data = report_heartbeat(
+        config,
+        None,
+        node_id=node_id,
+        status=status,
+        message=message,
+        op="release",
+        include_lines=False,
+    )
+    return bool(data and data.get("released"))
 
 
 def check_failover(config, node_id="gha"):
+    """检查心跳与租约。
+
+    返回 True 表示备机可以启动；False 表示不要动 DNS。
+
+    关键安全规则：
+      · 心跳接口不可达/返回异常时 fail-safe，不接管（避免主备同时写）；
+      · 主 VPS 租约仍有效时，即使心跳 stale 也等租约过期；
+      · VPS 恢复并报活后，GHA 主动 release，把租约交还。
     """
-    检查主力节点的心跳是否超时。
-    若主力正常，返回 False（备机无需接管，直接退出）；
-    若主力失联（>90m 或无法连接），返回 True（备机激活接管）。
-    """
-    url = config.get("heartbeat_url")
-    if not url:
-        log.info("未配置 heartbeat_url，备机默认接管执行")
-        return True
+    data = fetch_heartbeat(config)
+    if not data or not data.get("ok"):
+        log.warning("心跳接口不可用或返回异常，备机不接管（避免主备双写）")
+        return False
 
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": f"cf2dns/{node_id}"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if not data.get("ok"):
-                log.warning("心跳接口返回异常状态，备机接管: %s", data)
-                return True
+    is_stale = bool(data.get("is_stale", True))
+    owner = str(data.get("owner") or "")
+    last_node = str(data.get("node_id") or "")
+    lease_active = bool(data.get("lease_active", False))
 
-            is_stale = data.get("is_stale", True)
-            elapsed = data.get("elapsed_seconds")
-            primary_node = data.get("node_id") or "vps"
-
-            if not is_stale:
-                log.info(
-                    "[standby] 主力探针（%s）运行正常（上次打卡于 %s 秒前）。备机（%s）退避待命。",
-                    primary_node,
-                    elapsed,
-                    node_id,
-                )
-                return False
-
-            log.warning(
-                "[failover] ⚠️ 警告：主力探针（%s）心跳超时（已过去 %s 秒）！备机（%s）激活接管！",
-                primary_node,
-                elapsed,
-                node_id,
+    if not is_stale and last_node == "vps":
+        # VPS 已经恢复并报活；如果租约在 GHA 手里，主动交还，让下一轮 VPS 接管。
+        if owner == "gha":
+            release_lease(
+                config,
+                "gha",
+                status="released",
+                message="VPS 已恢复报活，GHA 交还租约",
             )
-            return True
-    except Exception as e:
-        log.warning("无法获取心跳状态（%s），为保证高可用，备机（%s）激活接管", e, node_id)
+            log.info("[standby] VPS 已恢复，GHA 已交还租约")
+        else:
+            log.info("[standby] VPS 心跳正常（%s 秒前），备机退避", data.get("elapsed_seconds"))
+        return False
+
+    if owner == "vps" and lease_active:
+        log.info("[standby] VPS 持有有效租约（剩余 %s 秒），备机等待", max(0, int((data.get("lease_until") or 0) / 1000 - time.time())))
+        return False
+
+    if not is_stale and owner != "gha":
+        log.info("[standby] 主节点心跳正常（%s 秒前），备机退避", data.get("elapsed_seconds"))
+        return False
+
+    if owner == "gha":
+        # 已经是 GHA 接管态：继续执行/续租；VPS 恢复的情况上面已经交还。
+        log.warning("[failover] GHA 继续接管（VPS 心跳 %s）", "stale" if is_stale else "fresh")
         return True
 
+    if not lease_active:
+        log.warning(
+            "[failover] VPS 心跳异常（%s 秒前）且无有效租约，GHA 尝试接管",
+            data.get("elapsed_seconds"),
+        )
+        return True
+
+    log.warning("[failover] 租约仍被其他节点持有（owner=%s），备机不接管", owner or "unknown")
+    return False
 
 def maybe_alert(config, state, dry_run, key, text):
     """同一 key 在 alert_cooldown 内只发一次。"""
@@ -463,13 +561,12 @@ def in_cloudflare(ip, nets):
 # --------------------------------------------------------------------------
 def probe_ip(ip, host, path, timeout, attempts):
     """返回 (ok, 毫秒)。TLS 带真实 SNI，接受 2xx/3xx。"""
-    ctx = ssl.create_default_context()
     best = None
     for _ in range(max(1, attempts)):
         started = time.time()
         try:
             raw = socket.create_connection((ip, 443), timeout=timeout)
-            tls = ctx.wrap_socket(raw, server_hostname=host)
+            tls = TLS_CONTEXT.wrap_socket(raw, server_hostname=host)
             req = (
                 f"GET {path} HTTP/1.1\r\n"
                 f"Host: {host}\r\n"
@@ -506,7 +603,8 @@ def probe_many(ips, host, probe_cfg):
             ): ip
             for ip in ips
         }
-        for future, ip in futures.items():
+        for future in as_completed(futures):
+            ip = futures[future]
             try:
                 ok, ms = future.result()
             except Exception:
@@ -573,7 +671,55 @@ def fetch_pool(config):
 # --------------------------------------------------------------------------
 # 线路决策
 # --------------------------------------------------------------------------
-def decide_line(line, spec, config, pool, nets, blacklist, host, current, entry):
+def probe_cached_many(ips, host, probe_cfg, cache):
+    """一次巡检内按 IP 缓存探测结果，避免同池被 电信/境外/教育网 重复探。"""
+    if cache is None:
+        return probe_many(ips, host, probe_cfg)
+    unique = list(dict.fromkeys(ip for ip in ips if ip))
+    missing = [ip for ip in unique if ip not in cache]
+    if missing:
+        results = probe_many(missing, host, probe_cfg)
+        for ip in missing:
+            cache[ip] = results.get(ip)
+    return {ip: cache[ip] for ip in unique if cache.get(ip) is not None}
+
+
+def probe_cached_one(ip, host, probe_cfg, cache):
+    if cache is None:
+        return probe_ip(
+            ip,
+            host,
+            probe_cfg["path"],
+            probe_cfg["timeout"],
+            probe_cfg["attempts"],
+        )
+    if ip not in cache:
+        ok, ms = probe_ip(
+            ip,
+            host,
+            probe_cfg["path"],
+            probe_cfg["timeout"],
+            probe_cfg["attempts"],
+        )
+        cache[ip] = ms if ok else None
+    ms = cache.get(ip)
+    return ms is not None, ms
+
+
+def decide_line(
+    line,
+    spec,
+    config,
+    pool,
+    nets,
+    blacklist,
+    host,
+    current,
+    entry,
+    *,
+    allow_rotate=True,
+    probe_cache=None,
+):
     """决定该线路应有的 A 记录集合。
 
     返回 (targets | None, reason, mode, failed_ips)：
@@ -583,6 +729,9 @@ def decide_line(line, spec, config, pool, nets, blacklist, host, current, entry)
     稳定性优先：仍然健康的现有 IP 一律保留，只有「死掉的」「数量不足的」
     才会被替换或补足；想换掉一个健康的 IP 必须同时满足「满了 rotate_after」
     且「候选确实更快 rotate_gain_ms 以上」——随机轮换的候选池不会让记录抖动。
+
+    allow_rotate=False 用于 GHA 接管和 VPS 刚恢复的第一轮：只保健康/补失效，
+    不按境外机器视角轮换。
     """
     want = int(spec.get("records", 1))
     probe_cfg = config["probe"]
@@ -592,8 +741,10 @@ def decide_line(line, spec, config, pool, nets, blacklist, host, current, entry)
         cands = list(spec.get("fixed") or [])
         if not cands and config.get("default_ip"):
             cands = [config["default_ip"]]
+        if not cands and config["fallback_ips"].get(line):
+            cands = [config["fallback_ips"][line]]
         if not cands:
-            return None, "固定线路没有配置 IP（default_ip / fixed），跳过", "dead", []
+            return None, "固定线路没有配置 IP（default_ip / fixed / fallback），跳过", "dead", []
     else:
         cands = list(pool.get(spec["pool"]) or [])
 
@@ -601,19 +752,29 @@ def decide_line(line, spec, config, pool, nets, blacklist, host, current, entry)
         ip for ip in cands if ip and ip not in blacklist and in_cloudflare(ip, nets)
     ]
 
-    cur_probe = probe_many(list(current), host, probe_cfg)
+    cur_probe = probe_cached_many(list(current), host, probe_cfg, probe_cache)
     kept = [ip for ip in current if ip in cur_probe]
     dead = [ip for ip in current if ip not in cur_probe]
-    fresh = probe_many([ip for ip in usable if ip not in current], host, probe_cfg)
+    fresh = probe_cached_many(
+        [ip for ip in usable if ip not in current], host, probe_cfg, probe_cache
+    )
     # 真正握不上手/非 2xx-3xx 的候选（不含「没被选中」的）
     failed = [ip for ip in usable if ip not in current and ip not in fresh]
+
+    # 候选池本身的顺序来自 Hostmonit 的运营商视角；同池去重后按池内顺序补位，
+    # 不按德国/美国探针的本地耗时重排，避免把运营商池里的低延迟候选排到后面。
+    pool_order = {ip: idx for idx, ip in enumerate(cands)}
+    ranked = sorted(
+        fresh.items(),
+        key=lambda kv: (pool_order.get(kv[0], 10 ** 9), kv[1], kv[0]),
+    )
 
     targets = list(kept)
     mode = "urgent" if dead else "keep"
 
-    # 1) 数量不足就补，按探测延迟从快到慢补
+    # 1) 数量不足就补
     if len(targets) < want:
-        for ip, _ms in sorted(fresh.items(), key=lambda kv: (kv[1], kv[0])):
+        for ip, _ms in ranked:
             if len(targets) >= want:
                 break
             targets.append(ip)
@@ -624,12 +785,11 @@ def decide_line(line, spec, config, pool, nets, blacklist, host, current, entry)
     if not targets:
         fallback = config["fallback_ips"].get(line)
         if fallback:
-            ok, ms = probe_ip(
+            ok, ms = probe_cached_one(
                 fallback,
                 host,
-                probe_cfg["path"],
-                probe_cfg["timeout"],
-                probe_cfg["attempts"],
+                probe_cfg,
+                probe_cache,
             )
             if ok:
                 return (
@@ -650,8 +810,7 @@ def decide_line(line, spec, config, pool, nets, blacklist, host, current, entry)
     rotate_after = config["switch"]["rotate_after"]
     rotate_gain = config["switch"]["rotate_gain_ms"]
     age = now - entry.get("last_change", 0)
-    if len(targets) >= want and fresh and age >= rotate_after:
-        ranked = sorted(fresh.items(), key=lambda kv: (kv[1], kv[0]))
+    if allow_rotate and len(targets) >= want and ranked and age >= rotate_after:
         pool_best = ranked[0][1]
         cur_best = min(cur_probe.get(ip, 10 ** 9) for ip in targets)
         if pool_best + rotate_gain <= cur_best:
@@ -676,9 +835,22 @@ def decide_line(line, spec, config, pool, nets, blacklist, host, current, entry)
 
 
 def apply_line(config, records, line, targets, ttl):
-    """把某线路的 A 记录对齐到 targets：先建后改后缀删。"""
+    """把某线路的 A 记录对齐到 targets：先建后改后缀删。
+
+    只管理 Remark=cf2dns:auto 的记录。同线路只要有手工记录就整条跳过：
+    宁可不优化，也不能把用户自己的 A/CNAME 改掉。
+    """
     sub = config.get("subdomain", "@")
-    current = [r for r in records if r.get("Line") == line and r.get("Type") == "A"]
+    line_records = [r for r in records if r.get("Line") == line and r.get("Type") == "A"]
+    unmanaged = [r for r in line_records if r.get("Remark") != "cf2dns:auto"]
+    if unmanaged:
+        log.warning(
+            "[%s] 存在未标记的 A 记录（%s），跳过该线路，避免动到手工配置",
+            line,
+            ", ".join(str(r.get("Value")) for r in unmanaged[:3]),
+        )
+        return False, "存在未标记记录，跳过"
+    current = [r for r in line_records if r.get("Remark") == "cf2dns:auto"]
     cur_values = [r.get("Value") for r in current]
     if sorted(cur_values) == sorted(targets):
         return False, "一致"
@@ -763,13 +935,21 @@ def cleanup_line_cnames(config, records, lines):
         if not has_a:
             continue
         for rec in records:
-            if rec.get("Line") == line and rec.get("Type") == "CNAME":
-                call_dnspod_api(
-                    "DeleteRecord",
-                    {"Domain": domain, "RecordId": rec.get("RecordId")},
-                    config,
+            if rec.get("Line") != line or rec.get("Type") != "CNAME":
+                continue
+            if rec.get("Remark") != "cf2dns:auto":
+                log.warning(
+                    "[%s] 存在未标记的 CNAME %s，跳过清理",
+                    line,
+                    rec.get("Value"),
                 )
-                log.info("[%s] 清理残留 CNAME %s", line, rec.get("Value"))
+                continue
+            call_dnspod_api(
+                "DeleteRecord",
+                {"Domain": domain, "RecordId": rec.get("RecordId")},
+                config,
+            )
+            log.info("[%s] 清理残留 CNAME %s", line, rec.get("Value"))
 
 
 # --------------------------------------------------------------------------
@@ -792,6 +972,61 @@ def run_sync(config, dry_run=False, node_id="vps"):
     if expired:
         log.info("黑名单过期 %d 条", len(expired))
 
+    heartbeat_enabled = bool(config.get("heartbeat_url") and config.get("heartbeat_token"))
+    recovering = False
+    lease_acquired = False
+
+    if not dry_run and heartbeat_enabled:
+        pre = fetch_heartbeat(config)
+        if node_id == "vps" and pre:
+            recovering = pre.get("owner") == "gha" or pre.get("node_id") == "gha"
+
+        lease = acquire_lease(
+            config,
+            node_id,
+            status="starting",
+            message=f"{node_id} 开始本轮巡检",
+        )
+        if not lease or not lease.get("acquired"):
+            owner = (lease or {}).get("owner") or (pre or {}).get("owner") or "unknown"
+            log.warning("[%s] 未获得租约（当前 owner=%s），本轮不写 DNS", node_id, owner)
+            maybe_alert(
+                config,
+                state,
+                dry_run,
+                "lease-unavailable",
+                f"cf2dns：{node_id} 未获得 D1 租约（当前 owner={owner}），本轮未改 DNS",
+            )
+            report_heartbeat(
+                config,
+                None,
+                node_id=node_id,
+                status="recovering" if node_id == "vps" else "standby",
+                message=f"租约由 {owner} 持有，等待交还",
+                include_lines=False,
+            )
+            if not dry_run:
+                save_json(STATE_FILE, state)
+            return 0
+
+        lease_acquired = True
+        if lease.get("previous_owner") == "gha":
+            recovering = True
+        log.info(
+            "[%s] 已获得租约（generation=%s, previous_owner=%s）",
+            node_id,
+            lease.get("generation"),
+            lease.get("previous_owner"),
+        )
+    elif not dry_run:
+        if node_id != "vps":
+            log.error("备机（%s）未配置 heartbeat_url/heartbeat_token，拒绝在无租约下写 DNS", node_id)
+            return 1
+        log.warning("未配置 heartbeat_url/heartbeat_token，跳过租约保护（单机模式）")
+
+    # GHA 接管时禁止 rotate；VPS 刚从 GHA 收回来时也先保健康，避免主备视角来回翻。
+    allow_rotate = node_id == "vps" and not recovering
+
     nets = cloudflare_networks(config)
     pool = fetch_pool(config)
     log.info("=== %s 优选巡检（%s） ===", domain, "dry-run" if dry_run else "live")
@@ -801,28 +1036,68 @@ def run_sync(config, dry_run=False, node_id="vps"):
     )
     sub = config.get("subdomain", "@")
     root = [r for r in records if r.get("Name") == sub]
-    current = {
-        line: sorted(
+
+    current = {}
+    unmanaged_lines = {}
+    for line in lines_cfg:
+        line_records = [
+            r for r in root if r.get("Line") == line and r.get("Type") == "A"
+        ]
+        unmanaged = [r for r in line_records if r.get("Remark") != "cf2dns:auto"]
+        if unmanaged:
+            unmanaged_lines[line] = unmanaged
+        current[line] = sorted(
             r.get("Value")
-            for r in root
-            if r.get("Line") == line and r.get("Type") == "A"
+            for r in line_records
+            if r.get("Remark") == "cf2dns:auto"
         )
-        for line in lines_cfg
-    }
 
     line_state = state.setdefault("lines", {})
     decisions, modes, failed_ips = {}, {}, set()
+    probe_cache = {}
     for line, spec in lines_cfg.items():
         entry = line_state.setdefault(line, {})
+        if line in unmanaged_lines:
+            decisions[line], modes[line] = None, "skip"
+            log.warning(
+                "[%s] 存在未标记的 A 记录（%s），整条线路跳过",
+                line,
+                ", ".join(str(r.get("Value")) for r in unmanaged_lines[line][:3]),
+            )
+            continue
         targets, reason, mode, failed = decide_line(
-            line, spec, config, pool, nets, blacklist, host, current[line], entry
+            line,
+            spec,
+            config,
+            pool,
+            nets,
+            blacklist,
+            host,
+            current[line],
+            entry,
+            allow_rotate=allow_rotate,
+            probe_cache=probe_cache,
         )
         decisions[line], modes[line] = targets, mode
         failed_ips.update(failed)
         log.info("[%s] %s", line, reason)
 
-    # 源站看门狗：所有线路（含兜底）都探不通，多半是本站挂了，别把 DNS 也拆了
-    if all(targets is None for targets in decisions.values()):
+    skip_lines = [ln for ln, m in modes.items() if m == "skip"]
+    if skip_lines:
+        maybe_alert(
+            config,
+            state,
+            dry_run,
+            "unmanaged-" + "-".join(sorted(skip_lines)),
+            f"cf2dns：{domain} 这些线路存在未标记记录，已跳过：{', '.join(skip_lines)}",
+        )
+
+    # 源站看门狗：所有真正探测的线路（含兜底）都探不通，多半是本站挂了，别把 DNS 也拆了。
+    # 全部 skip 不算源站故障，只是没权限管这些线路。
+    origin_down = not skip_lines and all(
+        targets is None for targets in decisions.values()
+    )
+    if origin_down:
         maybe_alert(
             config,
             state,
@@ -832,9 +1107,18 @@ def run_sync(config, dry_run=False, node_id="vps"):
         )
         if not dry_run:
             save_json(STATE_FILE, state)
+            if heartbeat_enabled:
+                clean = {k: [] for k in decisions}
+                report_heartbeat(
+                    config,
+                    clean,
+                    node_id=node_id,
+                    status="origin-down",
+                    message="所有线路（含兜底）均探不通，疑似源站故障；未改 DNS",
+                )
         return 0
 
-    dead_lines = [ln for ln, tg in decisions.items() if tg is None]
+    dead_lines = [ln for ln, tg in decisions.items() if tg is None and modes.get(ln) != "skip"]
     if dead_lines:
         maybe_alert(
             config,
@@ -925,45 +1209,71 @@ def run_sync(config, dry_run=False, node_id="vps"):
     want = config.get("www_cname")
     if not dry_run and want:
         www = [r for r in records if r.get("Name") == "www"]
-        if www and not (
-            www[0].get("Type") == "CNAME" and www[0].get("Value") == want
-        ):
-            call_dnspod_api(
-                "ModifyRecord",
-                {
-                    "Domain": domain,
-                    "RecordId": www[0]["RecordId"],
-                    "SubDomain": "www",
-                    "RecordType": "CNAME",
-                    "RecordLine": "默认",
-                    "Value": want,
-                    "TTL": ttl,
-                    "Remark": "cf2dns:auto",
-                },
+        www_unmanaged = [r for r in www if r.get("Remark") != "cf2dns:auto"]
+        if www_unmanaged:
+            log.warning("www 存在未标记记录，跳过 CNAME 修正")
+            maybe_alert(
                 config,
+                state,
+                dry_run,
+                "unmanaged-www",
+                f"cf2dns：{domain} 的 www 存在未标记记录，已跳过 CNAME 修正",
             )
-            log.info("www CNAME 已修正为 %s", want)
-        elif not www:
-            call_dnspod_api(
-                "CreateRecord",
-                {
-                    "Domain": domain,
-                    "SubDomain": "www",
-                    "RecordType": "CNAME",
-                    "RecordLine": "默认",
-                    "Value": want,
-                    "TTL": ttl,
-                    "Remark": "cf2dns:auto",
-                },
-                config,
-            )
-            log.info("www CNAME 已新建 -> %s", want)
+        else:
+            www_auto = [r for r in www if r.get("Remark") == "cf2dns:auto"]
+            if www_auto and not (
+                www_auto[0].get("Type") == "CNAME"
+                and www_auto[0].get("Value") == want
+            ):
+                call_dnspod_api(
+                    "ModifyRecord",
+                    {
+                        "Domain": domain,
+                        "RecordId": www_auto[0]["RecordId"],
+                        "SubDomain": "www",
+                        "RecordType": "CNAME",
+                        "RecordLine": "默认",
+                        "Value": want,
+                        "TTL": ttl,
+                        "Remark": "cf2dns:auto",
+                    },
+                    config,
+                )
+                log.info("www CNAME 已修正为 %s", want)
+            elif not www:
+                call_dnspod_api(
+                    "CreateRecord",
+                    {
+                        "Domain": domain,
+                        "SubDomain": "www",
+                        "RecordType": "CNAME",
+                        "RecordLine": "默认",
+                        "Value": want,
+                        "TTL": ttl,
+                        "Remark": "cf2dns:auto",
+                    },
+                    config,
+                )
+                log.info("www CNAME 已新建 -> %s", want)
 
+    status = "degraded" if dead_lines or fallback_lines or skip_lines else "ok"
     if not dry_run:
+        if recovering:
+            # 刚收回租约：给所有线路一个 6h 冷却，避免按 VPS 视角立刻翻回。
+            for entry in line_state.values():
+                entry["last_change"] = time.time()
+            log.info("检测到从 GHA 收回租约：本轮禁止轮换，并为各线路设置 6h 冷却")
         save_json(STATE_FILE, state)
         clean_decisions = {k: list(v) if v else [] for k, v in decisions.items()}
-        report_heartbeat(config, clean_decisions, node_id=node_id)
-        if node_id != "vps":
+        if heartbeat_enabled:
+            report_heartbeat(
+                config,
+                clean_decisions,
+                node_id=node_id,
+                status=status,
+                message=f"{node_id} 巡检完成，{len(changed_lines)} 条线路变更",
+            )
+        if node_id != "vps" and lease_acquired:
             send_telegram(
                 f"🚨 [cf2dns 备机接管]\n"
                 f"主机探针心跳超时，备机（{node_id}）已接管 {config['domain']} 的 DNS 优选调度！\n"
@@ -971,9 +1281,8 @@ def run_sync(config, dry_run=False, node_id="vps"):
                 config,
             )
 
-    log.info("=== 巡检完成 ===")
+    log.info("=== 巡检完成（%s） ===", status)
     return 0
-
 
 def ensure_state_dir():
     global STATE_DIR, STATE_FILE, BLACKLIST_FILE, CF_RANGES_CACHE
@@ -992,8 +1301,16 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只探测，不写 DNS")
     parser.add_argument("--config", help="配置文件路径（默认 <脚本目录>/config.json）")
     parser.add_argument("--failover", action="store_true", help="以备机故障转移模式运行：先查心跳，超时才接管")
-    parser.add_argument("--node-id", default="vps", help="当前节点标识（默认 vps，GitHub Actions 可传 gha）")
+    parser.add_argument(
+        "--node-id",
+        default="vps",
+        choices=("vps", "gha"),
+        help="当前节点标识（默认 vps；GitHub Actions 必须传 gha）",
+    )
     args = parser.parse_args()
+    if args.failover and args.node_id == "vps":
+        log.warning("--failover 未指定 --node-id gha，自动按 gha 运行，避免冒充主力")
+        args.node_id = "gha"
 
     if args.config:
         global CONFIG_FILE
@@ -1029,6 +1346,15 @@ def main():
             f"cf2dns：{config['domain']} 巡检抛异常，见 /var/log/cf2dns.log",
         )
         if not args.dry_run:
+            # 异常也要证明「探针还活着」，否则 90 分钟后会被备机误判失联。
+            report_heartbeat(
+                config,
+                None,
+                node_id=args.node_id,
+                status="error",
+                message="巡检异常，本轮未完成；保留当前租约",
+                include_lines=False,
+            )
             save_json(STATE_FILE, state)
         return 1
 
